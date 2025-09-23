@@ -1,0 +1,18 @@
+# Dependencias principales
+opencv-python==4.8.1.78
+mediapipe==0.10.7
+numpy==1.24.3
+scikit-learn==1.3.2
+joblib==1.3.2
+
+# Dependencias de desarrollo
+pytest==7.4.3
+pytest-cov==4.1.0
+black==23.9.1
+flake8==6.1.0
+mypy==1.6.1
+
+# Dependencias opcionales para futuras extensiones
+pyyaml==6.0.1
+matplotlib==3.7.2
+pandas==2.1.1

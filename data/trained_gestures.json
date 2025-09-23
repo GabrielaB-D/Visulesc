@@ -1,0 +1,44 @@
+{
+  "Hola": {
+    "features": {
+      "area": 135959.8,
+      "perimeter": 5011.853035497666,
+      "aspect_ratio": 1.0877198172377738,
+      "extent": 0.4068647990379854,
+      "vertices": 7.6,
+      "centroid_x": 847.624827865028,
+      "centroid_y": 377.2306366087256,
+      "convexity": 0.6629390365326749
+    },
+    "samples_count": 5,
+    "trained_date": "2025-09-21T17:15:00.871724"
+  },
+  "A": {
+    "features": {
+      "area": 158274.8,
+      "perimeter": 5731.169599366188,
+      "aspect_ratio": 0.955523679417122,
+      "extent": 0.4031174962298195,
+      "vertices": 9.8,
+      "centroid_x": 1047.6292443818825,
+      "centroid_y": 461.8368449931139,
+      "convexity": 0.5265325869751796
+    },
+    "samples_count": 5,
+    "trained_date": "2025-09-22T20:20:50.458601"
+  },
+  "F": {
+    "features": {
+      "area": 136257.4,
+      "perimeter": 3958.4137105464933,
+      "aspect_ratio": 1.068580077290466,
+      "extent": 0.5841362453892139,
+      "vertices": 10.2,
+      "centroid_x": 828.513374299557,
+      "centroid_y": 507.4007022152708,
+      "convexity": 0.700531991027585
+    },
+    "samples_count": 5,
+    "trained_date": "2025-09-22T20:20:00.767787"
+  }
+}
