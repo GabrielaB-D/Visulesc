@@ -1,7 +1,3 @@
-"""
-Sistema de Reconocimiento de Lenguaje de Señas LESCO
-Aplicación principal que integra detección de landmarks y reconocimiento básico de gestos.
-"""
 
 import cv2
 import time
@@ -9,6 +5,15 @@ import sys
 import os
 import numpy as np
 import math
+from collections import deque
+from typing import List, Tuple
+
+# Popup simple para ingresar nombre de gesto en escritorio
+try:
+    import tkinter as tk
+    from tkinter import simpledialog
+except Exception:
+    tk = None
 
 # Añadir el directorio src al path para imports
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -18,6 +23,9 @@ from config.settings import *
 from ui.main_window import MainWindow
 from gesture_recognition.gesture_classifier import GestureClassifier
 from data.user_manager import UserManager
+from gesture_recognition.gesture_repository import GestureRepository
+from gesture_recognition.realtime_matcher import RealTimeMatcher
+from gesture_recognition.feature_extractor import extract_features_for_both_hands
 
 # MediaPipe
 import mediapipe as mp
@@ -185,6 +193,8 @@ class LESCORecognitionSystem:
         self.main_window = MainWindow()
         self.classifier = GestureClassifier()
         self.user_manager = UserManager()
+        self.gesture_repo = GestureRepository()
+        self.matcher = None
         
         # Estado del sistema
         self.last_recognized_gesture = None
@@ -193,6 +203,15 @@ class LESCORecognitionSystem:
         self.is_running = False
         self.debug_mode = False
         self.current_user = "default"
+        # Buffer para gestos dinámicos (secuencia de landmarks normalizados)
+        self.sequence_buffer = deque(maxlen=45)  # ~1.5s @30fps
+        # Flags de control de UI
+        self.detect_gestures = False
+        # Botones de UI (OpenCV overlay)
+        self.ui_buttons: List[Tuple[str, Tuple[int,int,int,int]]] = []
+        # Captura dinámica manual (modo entrenador simple en main.py)
+        self.dynamic_capture_active = False
+        self.dynamic_capture_buffer: List[List[dict]] = []
 
         # MediaPipe Hands setup
         self.mp_hands = mp.solutions.hands
@@ -203,7 +222,25 @@ class LESCORecognitionSystem:
             min_tracking_confidence=0.5
         )
         self.mp_drawing = mp.solutions.drawing_utils
+        # Último output por mano: [{'handedness': 'Left'/'Right', 'landmarks': [...], 'recognized': str|None}]
+        self.last_hands_output = []
+        self.current_display_gesture = None
+        # Suavizado de gesto actual
+        self.display_history = deque(maxlen=10)
+        self.display_smoothed = None
+        self.status_text = "Sin detección"
+        self.capture_missing_counter = { 'Left': 0, 'Right': 0 }
+        self.CAPTURE_MISSING_LIMIT = 5
+        # Muestreo estadístico (plantilla estática con mean/std)
+        self.sampling_active = False
+        self.sampling_label = None
+        self.sampling_target_frames = 30
+        self.sampling_feat_list = []
+        self.sampling_left_missing = 0
+        self.sampling_right_missing = 0
         
+        # Cargar plantillas existentes para matching directo
+        self._reload_templates()
         print("Sistema LESCO inicializado correctamente")
         print("Sistema completo con entrenamiento de gestos disponible")
         print("Controles: ESC - Salir | R - Reconocimiento | T - Entrenamiento | M - Gestión | H - Ayuda")
@@ -219,6 +256,10 @@ class LESCORecognitionSystem:
         if not self.main_window.start():
             print("Error: No se pudo inicializar la ventana principal")
             return False
+        # Configurar callbacks de mouse para botones superpuestos
+        cv2.setMouseCallback(self.main_window.window_name, self._on_mouse)
+        # Definir botones UI
+        self._setup_ui_buttons()
         
         self.is_running = True
         return True
@@ -231,16 +272,72 @@ class LESCORecognitionSystem:
                 if not ret: break
                 
                 frame_resized = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT))
+                # Espejar horizontalmente para experiencia natural
+                frame_resized = cv2.flip(frame_resized, 1)
                 rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                # Optimización: evitar copias en MediaPipe
+                rgb.flags.writeable = False
                 
                 # Detectar landmarks
                 results = self.hands.process(rgb)
+                rgb.flags.writeable = True
                 landmarks = None
                 recognized_gesture = None
+                hands_output = []
                 
                 # Procesar resultados
                 if results.multi_hand_landmarks:
-                    landmarks = results.multi_hand_landmarks[0].landmark
+                    # Dibujar y preparar salida por mano
+                    multi_hand_landmarks = results.multi_hand_landmarks
+                    multi_handedness = getattr(results, 'multi_handedness', [None] * len(multi_hand_landmarks))
+                    
+                    for idx, hand_lms in enumerate(multi_hand_landmarks):
+                        # Handedness label
+                        handed_label = None
+                        if multi_handedness[idx] is not None:
+                            handed_label = multi_handedness[idx].classification[0].label  # 'Left'/'Right'
+                        
+                        # Lista de landmarks para salida
+                        lm_list = hand_lms.landmark
+                        # Dibujo de landmarks en el frame (una vez por mano)
+                        self.mp_drawing.draw_landmarks(
+                            frame_resized, hand_lms, self.mp_hands.HAND_CONNECTIONS
+                        )
+                        
+                        # Reconocimiento simple/matcher estático por mano si disponible
+                        recognized_label = None
+                        if self.matcher and self.detect_gestures:
+                            norm = self.gesture_repo.normalize_landmarks(lm_list)
+                            label_s, conf_s = self.matcher.match_static(norm)
+                            if label_s and conf_s >= 0.9:
+                                recognized_label = label_s
+                        
+                        # Overlay de texto para cada mano
+                        # Usar el landmark 0 (wrist) como ancla
+                        h, w = frame_resized.shape[:2]
+                        anchor_x = int(lm_list[0].x * w)
+                        anchor_y = int(lm_list[0].y * h)
+                        info_text = f"{handed_label or '-'}"
+                        if recognized_label:
+                            info_text += f" | {recognized_label}"
+                        cv2.putText(frame_resized, info_text, (anchor_x + 5, max(15, anchor_y - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                        
+                        hands_output.append({
+                            'handedness': handed_label,
+                            'landmarks': lm_list,
+                            'recognized': recognized_label
+                        })
+                        # Actualizar gesto actual (prioriza derecha)
+                        if recognized_label:
+                            if handed_label == 'Right':
+                                self.current_display_gesture = recognized_label
+                            elif handed_label == 'Left' and self.current_display_gesture is None:
+                                self.current_display_gesture = recognized_label
+                    
+                    # Mantener compatibilidad: usar primera mano para vías existentes
+                    if len(multi_hand_landmarks) > 0:
+                        landmarks = multi_hand_landmarks[0].landmark
                     
                     # Reconocer gesto usando el clasificador entrenado
                     if self.classifier.is_trained:
@@ -259,6 +356,21 @@ class LESCORecognitionSystem:
                         if gesture:
                             recognized_gesture = gesture
                     
+                    # Matching directo con plantillas (estático)
+                    if landmarks and self.matcher:
+                        norm = self.gesture_repo.normalize_landmarks(landmarks)
+                        label_s, conf_s = self.matcher.match_static(norm)
+                        if label_s and conf_s >= 0.9:
+                            recognized_gesture = label_s
+                        # Actualizar buffer para gestos dinámicos
+                        self.sequence_buffer.append(norm)
+                        # Intento de matching dinámico con una ventana reciente
+                        if len(self.sequence_buffer) >= 12:  # mínima duración
+                            window = list(self.sequence_buffer)[-30:]  # último ~1s
+                            label_d, conf_d = self.matcher.match_dynamic(window)
+                            if label_d and conf_d >= 0.6:
+                                recognized_gesture = label_d
+
                     # Manejar estabilidad del gesto
                     if recognized_gesture == self.last_recognized_gesture:
                         self.gesture_stability_counter += 1
@@ -270,9 +382,119 @@ class LESCORecognitionSystem:
                         print(f"✓ Gesto reconocido: {recognized_gesture}")
                         # Añadir al texto reconocido
                         self.main_window.text_display.add_text(recognized_gesture)
+                        # Limpiar buffer tras reconocimiento dinámico para evitar loops
+                        self.sequence_buffer.clear()
 
-                # Actualizar ventana principal
+                # Guardar salida por mano para acceso externo/debug
+                self.last_hands_output = hands_output
+
+                # Suavizado y estado
+                # Construir features con ambas manos para posible matching estadístico
+                left_lm = None; right_lm = None
+                for item in hands_output:
+                    if item['handedness'] == 'Left':
+                        left_lm = item['landmarks']
+                    elif item['handedness'] == 'Right':
+                        right_lm = item['landmarks']
+                feat_vec, left_present, right_present = extract_features_for_both_hands(left_lm, right_lm)
+                # Missing counters
+                self.capture_missing_counter['Left'] = 0 if left_present else self.capture_missing_counter['Left'] + 1
+                self.capture_missing_counter['Right'] = 0 if right_present else self.capture_missing_counter['Right'] + 1
+
+                # Smoothing del gesto actual
+                current_now = None
+                # 1) Intentar plantillas estáticas clásicas
+                if self.matcher and self.detect_gestures and len(hands_output) > 0:
+                    # usar primera mano para estático clásico
+                    lm_first = hands_output[0]['landmarks']
+                    norm_first = self.gesture_repo.normalize_landmarks(lm_first)
+                    label_s, conf_s = self.matcher.match_static(norm_first)
+                    if label_s and conf_s >= 0.9:
+                        current_now = label_s
+                # 2) Intentar plantilla estadística con Mahalanobis normalizado
+                if self.matcher and self.detect_gestures and current_now is None and feat_vec.size > 0:
+                    label_stat, conf_stat = self.matcher.match_statistical(feat_vec)
+                    if conf_stat >= 0.6:
+                        current_now = label_stat
+
+                self.display_history.append(current_now or "")
+                # media móvil por moda simple (mayoría de últimos N no vacíos)
+                values = [v for v in self.display_history if v]
+                self.display_smoothed = max(set(values), key=values.count) if values else None
+                self.current_display_gesture = self.display_smoothed
+
+                # Estado textual
+                if not left_present or not right_present:
+                    missing = 'izquierda' if not left_present else 'derecha'
+                    self.status_text = f"Falta mano {missing}"
+                elif self.current_display_gesture:
+                    self.status_text = "Estable"
+                else:
+                    self.status_text = "Sin detección"
+                
+                # Actualizar ventana principal (ya con overlays dibujados); pasar landmarks de compatibilidad
                 window_frame = self.main_window.update_frame(frame_resized, landmarks, recognized_gesture)
+
+                # Mostrar gesto/letra actual en overlay destacado
+                if self.current_display_gesture:
+                    cv2.rectangle(window_frame, (10, 90), (210, 130), (30, 30, 30), -1)
+                    cv2.putText(window_frame, f"Actual: {self.current_display_gesture}", (20, 120),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                else:
+                    # Área vacía opcional sin texto (se puede omitir para ahorrar draw)
+                    pass
+                # Mostrar estado secundario
+                cv2.putText(window_frame, f"Status: {self.status_text}", (10, 155),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+                # Muestreo estadístico en curso: agregar features y dibujar progreso/mensajes
+                if self.sampling_active:
+                    # Mensaje informativo
+                    cv2.rectangle(window_frame, (10, 170), (540, 235), (20, 20, 20), -1)
+                    msg = f"Grabando gesto '{self.sampling_label}' — mantén la pose ~1s. Nota: guardaremos media y variabilidad."
+                    cv2.putText(window_frame, msg[:65], (15, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+                    cv2.putText(window_frame, msg[65:130], (15, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+                    # Progreso
+                    done = len(self.sampling_feat_list)
+                    total = self.sampling_target_frames
+                    cv2.rectangle(window_frame, (15, 220), (515, 230), (60, 60, 60), 1)
+                    if total > 0:
+                        w = int(500 * min(1.0, done / total))
+                        cv2.rectangle(window_frame, (15, 220), (15 + w, 230), (0, 200, 255), -1)
+                    cv2.putText(window_frame, f"{done}/{total}", (520, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+                    # Inestabilidad / manos faltantes
+                    if self.sampling_left_missing > self.CAPTURE_MISSING_LIMIT or self.sampling_right_missing > self.CAPTURE_MISSING_LIMIT:
+                        cv2.putText(window_frame, "Falta mano izquierda/derecha — reintenta", (15, 245), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+                    # Recolectar features de este frame
+                    if feat_vec.size > 0:
+                        self.sampling_feat_list.append(feat_vec)
+                        # Abort por manos faltantes persistentes
+                        if not left_present:
+                            self.sampling_left_missing += 1
+                        else:
+                            self.sampling_left_missing = 0
+                        if not right_present:
+                            self.sampling_right_missing += 1
+                        else:
+                            self.sampling_right_missing = 0
+
+                    # Finalizar si alcanza el objetivo
+                    if len(self.sampling_feat_list) >= self.sampling_target_frames:
+                        self._finalize_sampling()
+
+                # Si está activo el modo de captura dinámica, agregar frame actual (primera mano si existe)
+                if self.dynamic_capture_active and self.last_hands_output:
+                    lm_list = self.last_hands_output[0].get('landmarks')
+                    if lm_list:
+                        norm = self.gesture_repo.normalize_landmarks(lm_list)
+                        self.dynamic_capture_buffer.append(norm)
+                        # Mostrar conteo en overlay
+                        cv2.putText(window_frame, f"Dyn frames: {len(self.dynamic_capture_buffer)}", (10, 80),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+
+                # Dibujar barra de botones sobre la ventana
+                self._draw_buttons(window_frame)
                 
                 # Mostrar frame
                 cv2.imshow(self.main_window.window_name, window_frame)
@@ -283,6 +505,19 @@ class LESCORecognitionSystem:
                     # Manejar teclas específicas del sistema principal
                     if key == ord('n') or key == ord('N'):
                         self._start_new_gesture_training()
+                    elif key == ord('g') or key == ord('G'):
+                        # Guardar snapshot como gesto estático rápido
+                        if landmarks:
+                            name = input("Nombre del gesto estático: ").strip()
+                            if name:
+                                norm = self.gesture_repo.normalize_landmarks(landmarks)
+                                if self.gesture_repo.save_static(name, norm, user_id=self.current_user):
+                                    print(f"Gesto '{name}' guardado. Recargando plantillas...")
+                                    self._reload_templates()
+                    elif key == ord('j') or key == ord('J'):
+                        # Toggle detección de gestos desde teclado
+                        self.detect_gestures = not self.detect_gestures
+                        print(f"Detección de gestos: {'ON' if self.detect_gestures else 'OFF'}")
                 
         finally:
             self.cleanup()
@@ -316,6 +551,189 @@ class LESCORecognitionSystem:
             print("Entrenamiento iniciado. Sigue las instrucciones en pantalla.")
         else:
             print("Error iniciando el entrenamiento")
+
+    def _reload_templates(self):
+        """Carga/recarga plantillas del repositorio para el matcher en tiempo real."""
+        templates = self.gesture_repo.load_templates(user_id=self.current_user)
+        self.matcher = RealTimeMatcher(templates)
+
+    # ===================== UI Overlay (OpenCV) =====================
+    def _setup_ui_buttons(self):
+        # Define posiciones y tamaños de los botones en la barra superior
+        x, y, h = 10, 10, 30
+        spacing = 8
+        labels = [
+            "Manos",            # iniciar manos (ya activo)
+            "Gestos ON/OFF",   # toggle
+            "Entrenador",      # modo entrenamiento
+            "Capturar Dyn",    # iniciar/pausar captura dinámica
+            "Guardar Dyn",     # guardar gesto dinámico
+            "Nuevo Estático",  # captura estática
+            "Muestrear Stat",  # iniciar muestreo estadístico
+            "Pausar"           # pausar/detener
+        ]
+        self.ui_buttons = []
+        for label in labels:
+            w = 140
+            self.ui_buttons.append((label, (x, y, w, h)))
+            x += w + spacing
+
+    def _draw_buttons(self, frame):
+        for label, (x, y, w, h) in self.ui_buttons:
+            # Fondo
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 40, 40), -1)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (100, 100, 100), 1)
+            # Texto
+            txt = label
+            if label == "Gestos ON/OFF":
+                txt = f"Gestos: {'ON' if self.detect_gestures else 'OFF'}"
+            elif label == "Capturar Dyn":
+                txt = f"Dyn: {'REC' if self.dynamic_capture_active else 'PAUSA'}"
+            cv2.putText(frame, txt, (x + 6, y + int(h*0.7)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    def _on_mouse(self, event, mx, my, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        for label, (x, y, w, h) in self.ui_buttons:
+            if x <= mx <= x + w and y <= my <= y + h:
+                self._handle_button(label)
+                break
+
+    def _handle_button(self, label: str):
+        if label == "Manos":
+            print("Cámara ya activa")
+        elif label == "Gestos ON/OFF":
+            self.detect_gestures = not self.detect_gestures
+            print(f"Detección de gestos: {'ON' if self.detect_gestures else 'OFF'}")
+        elif label == "Entrenador":
+            # Cambiar a modo entrenamiento en la ventana
+            self.main_window._switch_to_training_mode()
+        elif label == "Capturar Dyn":
+            # Alternar captura dinámica manual
+            self.dynamic_capture_active = not self.dynamic_capture_active
+            if self.dynamic_capture_active:
+                self.dynamic_capture_buffer.clear()
+                print("Captura dinámica: INICIADA")
+            else:
+                print("Captura dinámica: PAUSADA")
+        elif label == "Guardar Dyn":
+            # Guardar gesto dinámico si hay suficientes frames
+            if len(self.dynamic_capture_buffer) < 5:
+                print("Captura dinámica insuficiente (mínimo 5 frames)")
+            else:
+                name = self._prompt_gesture_name()
+                if name:
+                    if self.gesture_repo.save_dynamic(name, self.dynamic_capture_buffer, fps=30, user_id=self.current_user):
+                        print(f"Gesto dinámico '{name}' guardado. Recargando plantillas...")
+                        self._reload_templates()
+                    self.dynamic_capture_buffer.clear()
+        elif label == "Nuevo Estático":
+            # Capturar primer mano y guardar como plantilla estática
+            if self.last_hands_output:
+                lm_list = self.last_hands_output[0].get('landmarks')
+                if lm_list:
+                    name = self._prompt_gesture_name()
+                    if name:
+                        norm = self.gesture_repo.normalize_landmarks(lm_list)
+                        if self.gesture_repo.save_static(name, norm, user_id=self.current_user):
+                            print(f"Gesto '{name}' guardado. Recargando plantillas...")
+                            self._reload_templates()
+        elif label == "Muestrear Stat":
+            # Iniciar muestreo estadístico
+            name = self._prompt_gesture_name()
+            if name:
+                self.start_gesture_capture(name)
+        elif label == "Pausar":
+            # Simular ESC
+            self.is_running = False
+
+    def _prompt_gesture_name(self) -> str:
+        # Preferir popup Tkinter si disponible, si no usar consola
+        try:
+            if tk is not None:
+                root = tk.Tk()
+                root.withdraw()
+                value = simpledialog.askstring("Nuevo gesto estático", "Nombre del gesto:")
+                root.destroy()
+                if value:
+                    return value.strip()
+        except Exception:
+            pass
+        try:
+            return input("Nombre del gesto estático: ").strip()
+        except Exception:
+            return ""
+
+    # ========= API expuesta =========
+    def start_gesture_capture(self, label: str, target_frames: int = 30):
+        self.sampling_active = True
+        self.sampling_label = label
+        self.sampling_target_frames = target_frames
+        self.sampling_feat_list = []
+        self.sampling_left_missing = 0
+        self.sampling_right_missing = 0
+        print(f"Grabando gesto '{label}' — mantén la pose durante ~1 segundo. Atención: no es posible 100% estabilidad; guardaremos media y variabilidad.")
+
+    def abort_gesture_capture(self):
+        if self.sampling_active:
+            self.sampling_active = False
+            self.sampling_feat_list = []
+            print("Muestreo abortado")
+
+    def save_gesture(self, metadata: dict = None):
+        # Forzar finalización si está activo
+        if self.sampling_active:
+            self._finalize_sampling()
+        else:
+            print("No hay muestreo activo para guardar")
+
+    def get_current_detection(self) -> dict:
+        return {
+            'current_gesture': self.current_display_gesture,
+            'status': self.status_text,
+            'hands': self.last_hands_output,
+        }
+
+    def _finalize_sampling(self):
+        # Abort si manos faltantes persistentes
+        if self.sampling_left_missing > self.CAPTURE_MISSING_LIMIT or self.sampling_right_missing > self.CAPTURE_MISSING_LIMIT:
+            print("Falta mano izquierda/derecha — reposición requerida para este gesto.")
+            self.abort_gesture_capture()
+            return
+        if not self.sampling_feat_list:
+            print("No hay muestras para guardar")
+            self.abort_gesture_capture()
+            return
+        feats = np.vstack(self.sampling_feat_list).astype(np.float32)
+        mean = feats.mean(axis=0)
+        std = feats.std(axis=0) + 1e-6
+        # Variability score: promedio de std/|mean| en características con |mean|>epsilon
+        denom = np.where(np.abs(mean) < 1e-6, 1e-6, np.abs(mean))
+        variability = float(np.mean(std / denom))
+        # Confianza promedio (heurística): 1 - (media |z| / 3)
+        z = np.abs((feats - mean) / std)
+        avg_z = float(np.mean(z))
+        avg_conf = max(0.0, 1.0 - (avg_z / 3.0))
+        if avg_conf < 0.6:
+            print("Gesto inestable: intenta reducir movimiento o sostener la pose por más tiempo.")
+            self.abort_gesture_capture()
+            return
+        ok = self.gesture_repo.save_statistical(
+            self.sampling_label,
+            mean_features=mean.tolist(),
+            std_features=std.tolist(),
+            num_frames=len(self.sampling_feat_list),
+            variability_score=variability,
+            avg_confidence=avg_conf,
+            user_id=self.current_user,
+        )
+        if ok:
+            print(f"Gesto '{self.sampling_label}' guardado (estadístico). Variabilidad: {variability:.3f}, Confianza: {avg_conf:.2f}")
+            self._reload_templates()
+        else:
+            print("Error al guardar gesto estadístico")
+        self.sampling_active = False
+        self.sampling_feat_list = []
 
     def _draw_debug_info(self, frame):
         """Dibuja información de debug en el frame"""

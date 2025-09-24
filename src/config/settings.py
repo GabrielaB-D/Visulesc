@@ -3,7 +3,9 @@
 # Parámetros de optimización
 TARGET_WIDTH = 256
 TARGET_HEIGHT = 192
-SEND_EVERY_N_FRAMES = 2
+SEND_EVERY_N_FRAMES = 2  # procesamiento cada N frames (valor inicial)
+TARGET_FPS = 24          # objetivo de FPS para dispositivos móviles
+MAX_PROCESS_EVERY_N_FRAMES = 4  # límite superior de salto de frames
 NUM_HANDS = 2
 
 # Configuración de detección

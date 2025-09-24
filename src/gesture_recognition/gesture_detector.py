@@ -118,17 +118,26 @@ class GestureDetector:
         Returns:
             True si hay movimiento significativo
         """
-        if self.last_landmarks is None:
-            self.last_landmarks = landmarks
+        # Aceptar tanto listas de landmarks como objetos MediaPipe con atributo `.landmark`
+        current_landmarks = getattr(landmarks, 'landmark', landmarks)
+        previous_landmarks = getattr(self.last_landmarks, 'landmark', self.last_landmarks)
+
+        if self.last_landmarks is None or previous_landmarks is None:
+            # Inicializar con la lista actual de landmarks
+            self.last_landmarks = current_landmarks
             return True  # Primer frame siempre cuenta como movimiento
         
         # Calcular distancia promedio entre landmarks
         total_distance = 0
-        num_landmarks = min(len(landmarks), len(self.last_landmarks))
+        try:
+            num_landmarks = min(len(current_landmarks), len(previous_landmarks))
+        except TypeError:
+            # Si por alguna razón no son indexables, considerar movimiento nulo
+            num_landmarks = 0
         
         for i in range(num_landmarks):
-            current = landmarks[i]
-            previous = self.last_landmarks[i]
+            current = current_landmarks[i]
+            previous = previous_landmarks[i]
             
             # Calcular distancia euclidiana normalizada
             distance = np.sqrt(
@@ -139,8 +148,8 @@ class GestureDetector:
         
         avg_distance = total_distance / num_landmarks if num_landmarks > 0 else 0
         
-        # Actualizar landmarks anteriores
-        self.last_landmarks = landmarks
+        # Actualizar landmarks anteriores con la lista normalizada
+        self.last_landmarks = current_landmarks
         
         return avg_distance > self.movement_threshold
     

@@ -14,6 +14,7 @@ from src.ui.training_ui import TrainingUI
 from src.ui.text_display import TextDisplay
 from src.gesture_recognition.gesture_classifier import GestureClassifier
 from src.data.user_manager import UserManager
+from src.hand_tracking.visualizer import HandVisualizer
 
 
 class MainWindow:
@@ -35,6 +36,7 @@ class MainWindow:
         self.text_display = TextDisplay()
         self.classifier = GestureClassifier()
         self.user_manager = UserManager()
+        self.hand_visualizer = HandVisualizer()
         
         # Estado del sistema
         self.current_user = "default"
@@ -119,6 +121,7 @@ class MainWindow:
         
         # Dibujar landmarks si están disponibles
         if landmarks:
+            # Usar visualizador con overlays de debug según bandera
             self._draw_landmarks_on_frame(camera_resized, landmarks)
             window_image[50:50+self.camera_height, 50:50+self.camera_width] = camera_resized
         
@@ -142,12 +145,14 @@ class MainWindow:
         """Dibuja los landmarks en el frame."""
         if not landmarks:
             return
-        
-        # Dibujar puntos de landmarks
-        for landmark in landmarks:
-            x = int(landmark.x * frame.shape[1])
-            y = int(landmark.y * frame.shape[0])
-            cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
+        # El visualizador espera una lista de manos; convertimos landmarks actuales
+        self.hand_visualizer.draw_landmarks(
+            frame,
+            [landmarks],
+            debug=self.debug_mode,
+            show_indices=self.debug_mode,
+            show_coords=self.debug_mode,
+        )
     
     def _draw_info_panel(self, window_image: np.ndarray):
         """Dibuja el panel de información."""
