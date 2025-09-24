@@ -1,0 +1,14 @@
+{
+  "default": {
+    "name": "Usuario por Defecto",
+    "created_date": "2025-09-24T07:34:09.013082",
+    "last_active": "2025-09-24T07:34:09.013082",
+    "gestures_count": 0,
+    "preferences": {
+      "pause_threshold": 0.3,
+      "min_gesture_frames": 10,
+      "max_gesture_frames": 120,
+      "movement_threshold": 0.02
+    }
+  }
+}

@@ -132,9 +132,7 @@ dmypy.json
 *.tflite
 
 # LESCO Project specific
-data/gestures/*.json
-data/users/*.json
-data/config/*.json
+
 *.pkl
 logs/
 output/
