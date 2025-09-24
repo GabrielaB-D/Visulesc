@@ -239,6 +239,27 @@ class LESCORecognitionSystem:
         self.sampling_left_missing = 0
         self.sampling_right_missing = 0
         
+    def _ema_smooth_sequence(self, sequence_norm, alpha: float = 0.3):
+        """Suaviza una secuencia de landmarks normalizados (lista de lista de dicts {x,y,z})."""
+        if not sequence_norm:
+            return []
+        smoothed = []
+        prev = None
+        for frame in sequence_norm:
+            if prev is None:
+                prev = frame
+            else:
+                merged = []
+                for i in range(min(len(frame), len(prev))):
+                    fx, fy, fz = frame[i]['x'], frame[i]['y'], frame[i].get('z', 0.0)
+                    px, py, pz = prev[i]['x'], prev[i]['y'], prev[i].get('z', 0.0)
+                    sx = alpha * fx + (1 - alpha) * px
+                    sy = alpha * fy + (1 - alpha) * py
+                    sz = alpha * fz + (1 - alpha) * pz
+                    merged.append({'x': sx, 'y': sy, 'z': sz})
+                prev = merged
+            smoothed.append(prev)
+        return smoothed
         # Cargar plantillas existentes para matching directo
         self._reload_templates()
         print("Sistema LESCO inicializado correctamente")
@@ -356,7 +377,7 @@ class LESCORecognitionSystem:
                         if gesture:
                             recognized_gesture = gesture
                     
-                    # Matching directo con plantillas (estático)
+                    # Matching directo con plantillas (estático) y dinámico con diagnóstico
                     if landmarks and self.matcher:
                         norm = self.gesture_repo.normalize_landmarks(landmarks)
                         label_s, conf_s = self.matcher.match_static(norm)
@@ -367,8 +388,25 @@ class LESCORecognitionSystem:
                         # Intento de matching dinámico con una ventana reciente
                         if len(self.sequence_buffer) >= 12:  # mínima duración
                             window = list(self.sequence_buffer)[-30:]  # último ~1s
+                            # Log previo
+                            try:
+                                est_ms = int(1000 * len(window) / 30.0)
+                                print(f"[DynDiag] frames={len(window)} ~duration={est_ms}ms (raw)")
+                            except Exception:
+                                pass
                             label_d, conf_d = self.matcher.match_dynamic(window)
-                            if label_d and conf_d >= 0.6:
+                            if not (label_d and conf_d >= 0.6):
+                                # Reintento con suavizado EMA
+                                smooth_win = self._ema_smooth_sequence(window, alpha=0.3)
+                                try:
+                                    est_ms = int(1000 * len(smooth_win) / 30.0)
+                                    print(f"[DynDiag] frames={len(smooth_win)} ~duration={est_ms}ms (ema0.3)")
+                                except Exception:
+                                    pass
+                                label2, conf2 = self.matcher.match_dynamic(smooth_win)
+                                if label2 and conf2 >= 0.55:
+                                    label_d, conf_d = label2, conf2
+                            if label_d and conf_d >= 0.55:
                                 recognized_gesture = label_d
 
                     # Manejar estabilidad del gesto
